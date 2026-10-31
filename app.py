@@ -1,4 +1,7 @@
+
 import streamlit as st
+from groq import Groq
+import math
 
 st.set_page_config(
     page_title="Clutch | Match Centre",
@@ -7,7 +10,32 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
+
+def get_ai_response(system_prompt, user_prompt):
+    try:
+        client = Groq(api_key=st.secrets["GROQ_API_KEY"])
+
+        response = client.chat.completions.create(
+            model="openai/gpt-oss-120b",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.5,
+            max_completion_tokens=700
+        )
+
+        return response.choices[0].message.content
+
+    except KeyError:
+        return "GROQ_API_KEY is missing. Please add it to your Streamlit secrets."
+
+    except Exception as e:
+        return f"AI request failed: {str(e)}"
+
+
 # ---------- CUSTOM DESIGN ----------
+
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap');
@@ -205,6 +233,7 @@ st.markdown("""
 
 
 # ---------- SAMPLE MATCH DATA ----------
+
 target = 180
 runs_scored = 120
 wickets_lost = 4
@@ -214,8 +243,6 @@ total_overs = 20
 runs_needed = target - runs_scored
 balls_remaining = (total_overs - overs_completed) * 6
 
-# Sample events from the current innings.
-# Two wickets fell in these events; two had fallen earlier.
 match_events = [
     {
         "over": "10.2",
@@ -244,8 +271,35 @@ match_events = [
     }
 ]
 
+# Context shared with both AI features.
+event_context = "\n".join(
+    [
+        f"Over {event['over']}: {event['event']} - {event['details']}"
+        for event in match_events
+    ]
+)
+
+match_context = f"""
+Match: India vs Australia, T20 International, second innings.
+India's score: {runs_scored}/{wickets_lost}.
+Target: {target}.
+Overs completed: {overs_completed} out of {total_overs}.
+Runs needed: {runs_needed}.
+Balls remaining: {balls_remaining}.
+
+Selected key events (this is NOT the complete ball-by-ball commentary):
+{event_context}
+
+Important:
+- These are only selected events, not the full innings.
+- Two wickets appear in the listed events. The score shows four wickets in total.
+- Do not invent additional events, player statistics, or match conditions.
+- If information is unavailable, clearly say so.
+"""
+
 
 # ---------- HEADER ----------
+
 header_left, header_right = st.columns([3, 1])
 
 with header_left:
@@ -269,6 +323,7 @@ st.markdown("<br>", unsafe_allow_html=True)
 
 
 # ---------- MATCH CENTRE / 01 ----------
+
 st.markdown(
     '<div class="section-label">MATCH CENTRE / 01</div>',
     unsafe_allow_html=True
@@ -292,6 +347,7 @@ st.markdown(f"""
 
 
 # ---------- THE NUMBERS / 02 ----------
+
 st.markdown(
     '<div class="section-label">THE NUMBERS / 02</div>',
     unsafe_allow_html=True
@@ -324,6 +380,7 @@ st.markdown("<br>", unsafe_allow_html=True)
 
 
 # ---------- CATCH ME UP / 03 ----------
+
 st.markdown(
     '<div class="section-label">CATCH ME UP / 03</div>',
     unsafe_allow_html=True
@@ -333,55 +390,56 @@ st.markdown("""
 <div class="feature-card">
     <div class="feature-title">Missed the action?</div>
     <div class="feature-description">
-        Get a quick recap of key moments, wickets, and boundaries
-        so you can understand how the match has unfolded.
+        Get an AI-generated story of key moments, wickets,
+        boundaries, and changes in match momentum.
     </div>
 </div>
 """, unsafe_allow_html=True)
 
-if st.button("⚡ Summarize Match", use_container_width=True):
+fan_level = st.selectbox(
+    "Choose how you want the match explained",
+    ["Beginner", "Regular fan", "Analyst"],
+    key="fan_level"
+)
 
-    wickets = [
-        event for event in match_events
-        if event["event"] == "WICKET"
-    ]
+if st.button("⚡ Generate AI Match Story", use_container_width=True):
 
-    boundaries = [
-        event for event in match_events
-        if event["event"] in ["FOUR", "SIX"]
-    ]
+    system_prompt = f"""
+    You are Clutch, a cricket match companion.
 
-    st.markdown("### 🏏 Match Summary")
+    Explain cricket in a clear, engaging and useful way.
 
-    st.write(
-        f"India has scored **{runs_scored}/{wickets_lost}** "
-        f"while chasing {target}. "
-        f"In the listed events, there were **{len(wickets)} wickets** "
-        f"and **{len(boundaries)} boundaries**."
-    )
+    The user's cricket knowledge level is: {fan_level}.
 
-    st.markdown("#### Key moments")
+    Adjust your explanation:
+    - Beginner: use simple words and explain cricket terms.
+    - Regular fan: explain the important moments and their impact.
+    - Analyst: give more tactical context, while staying grounded in the data.
 
-    for event in match_events:
-        if event["event"] == "WICKET":
-            icon = "🔴"
-        elif event["event"] == "SIX":
-            icon = "🟢"
-        else:
-            icon = "⚡"
+    Use only the match information supplied.
+    Do not invent events, statistics, player form, or match conditions.
+    Make clear that the event list contains selected moments only.
+    Focus on what happened, why it matters, and what to watch next.
+    Keep the answer concise and easy to read.
+    """
 
-        st.markdown(
-            f"{icon} **Over {event['over']} — {event['event']}**  \n"
-            f"{event['details']}"
+    with st.spinner("Clutch is analysing the match..."):
+        story = get_ai_response(
+            system_prompt,
+            f"Create a match story using this information:\n{match_context}"
         )
 
+    st.markdown("### 🏏 AI Match Story")
+    st.markdown(story)
+
     st.caption(
-        "This recap is generated from sample match events, "
-        "not from live match data or an AI model."
+        "AI-generated explanation based on selected sample match events. "
+        "Not connected to live match data."
     )
 
 
 # ---------- MATCH INSIGHTS / 04 ----------
+
 st.markdown("<br>", unsafe_allow_html=True)
 
 st.markdown(
@@ -427,7 +485,10 @@ if st.button("Analyse match situation  →", use_container_width=True):
         "This is a mathematical match analysis, not a prediction "
         "of the probability of winning."
     )
-    # ---------- WIN PREDICTOR / 05 ----------
+
+
+# ---------- WIN PREDICTOR / 05 ----------
+
 st.markdown("<br>", unsafe_allow_html=True)
 
 st.markdown(
@@ -445,7 +506,6 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# User inputs
 st.markdown("#### Adjust match situation")
 
 input_col1, input_col2 = st.columns(2)
@@ -488,13 +548,11 @@ with input_col2:
         key="predictor_target"
     )
 
-# Calculate match situation
 runs_remaining = max(prediction_target - current_runs, 0)
 balls_remaining_predictor = (20 - overs) * 6
 
 st.markdown("---")
 
-# Handle completed or tied chases
 if current_runs >= prediction_target:
 
     st.success("🏆 The target has been reached!")
@@ -505,38 +563,27 @@ elif wickets == 10 or balls_remaining_predictor == 0:
 
 else:
     overs_remaining = balls_remaining_predictor / 6
-
     required_run_rate = runs_remaining / overs_remaining
 
     current_run_rate = (
-        current_runs / overs
-        if overs > 0
-        else 0
+        current_runs / overs if overs > 0 else 0
     )
 
     wickets_remaining = 10 - wickets
 
-    # Simple heuristic score — not a trained ML model.
+    # Simple heuristic score, not a trained ML model.
     difficulty = (
         (required_run_rate * 3)
         - (wickets_remaining * 1.5)
         - (current_run_rate * 0.5)
     )
 
-    # Convert the difficulty score to a rough probability.
-    # Clamp the result to keep it between 5% and 95%.
-    import math
-
-    estimated_chance = 100 / (1 + math.exp(
-        max(-20, min(20, difficulty - 12))
-    ))
-
-    estimated_chance = max(
-        5,
-        min(95, estimated_chance)
+    estimated_chance = 100 / (
+        1 + math.exp(max(-20, min(20, difficulty - 12)))
     )
 
-    # Match situation metrics
+    estimated_chance = max(5, min(95, estimated_chance))
+
     metric1, metric2, metric3 = st.columns(3)
 
     with metric1:
@@ -546,15 +593,11 @@ else:
         st.metric("Balls remaining", balls_remaining_predictor)
 
     with metric3:
-        st.metric(
-            "Required run rate",
-            f"{required_run_rate:.2f}"
-        )
+        st.metric("Required run rate", f"{required_run_rate:.2f}")
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    st.markdown("#### Estimated chasing-team outlook")
-
+    st.markdown("#### Illustrative chase outlook")
     st.progress(int(estimated_chance))
 
     st.markdown(
@@ -564,7 +607,7 @@ else:
                 {estimated_chance:.1f}%
             </div>
             <div style="color:#9BA2AE;font-size:13px;">
-                Illustrative chance of completing the chase
+                Prototype heuristic score, not a real win probability
             </div>
         </div>
         """,
@@ -591,11 +634,12 @@ else:
 
     st.caption(
         "Prototype estimate only. This uses a manually designed "
-        "heuristic, not a trained machine-learning model or live match data. "
-        "It does not account for batter quality, bowler quality, venue, "
-        "pitch, weather, or historical match outcomes."
+        "heuristic, not a trained machine-learning model or live match data."
     )
-    # ---------- ASK CLUTCH / 06 ----------
+
+
+# ---------- ASK CLUTCH / 06 ----------
+
 st.markdown("<br>", unsafe_allow_html=True)
 
 st.markdown(
@@ -607,15 +651,15 @@ st.markdown("""
 <div class="feature-card">
     <div class="feature-title">Your match. Your questions.</div>
     <div class="feature-description">
-        Ask about the score, required run rate, remaining balls,
-        or key moments from the match.
+        Ask Clutch anything about the match. Get an explanation
+        tailored to your cricket knowledge level.
     </div>
 </div>
 """, unsafe_allow_html=True)
 
 question = st.text_input(
     "Ask a question",
-    placeholder="e.g. How many runs does India need?",
+    placeholder="e.g. Why was Rahul's wicket important?",
     key="clutch_question"
 )
 
@@ -625,79 +669,46 @@ if st.button("Ask Clutch →", use_container_width=True):
         st.warning("Please enter a question first.")
 
     else:
-        q = question.lower()
+        system_prompt = f"""
+        You are Clutch, an AI cricket match companion.
+
+        The user's cricket knowledge level is: {fan_level}.
+
+        Answer in a clear and friendly way.
+        Use only the match information provided.
+        Do not invent scores, events, player statistics, or match conditions.
+        If the data does not contain the answer, say so.
+        Explain cricket terminology when useful.
+        Keep answers focused and concise.
+        """
+
+        with st.spinner("Clutch is thinking..."):
+            answer = get_ai_response(
+                system_prompt,
+                f"""
+                Match information:
+                {match_context}
+
+                User's question:
+                {question}
+                """
+            )
 
         st.markdown("#### 💬 Clutch's Answer")
+        st.markdown(answer)
 
-        if "target" in q:
-            st.write(
-                f"India is chasing a target of {target} runs."
-            )
-
-        elif "run rate" in q or "required rate" in q:
-            rate = runs_needed / (balls_remaining / 6)
-
-            st.write(
-                f"India needs {runs_needed} runs from "
-                f"{balls_remaining} balls. The required run rate "
-                f"is {rate:.2f} runs per over."
-            )
-
-        elif "how many runs" in q or "runs needed" in q:
-            st.write(
-                f"India needs {runs_needed} more runs "
-                f"to reach the target of {target}."
-            )
-
-        elif "ball" in q or "overs left" in q:
-            st.write(
-                f"There are {balls_remaining} balls remaining "
-                f"({balls_remaining // 6} overs)."
-            )
-
-        elif "wicket" in q:
-            st.write(
-                f"India has lost {wickets_lost} wickets "
-                f"and has {10 - wickets_lost} wickets remaining."
-            )
-
-        elif "boundary" in q or "four" in q or "six" in q:
-            boundaries = [
-                event for event in match_events
-                if event["event"] in ["FOUR", "SIX"]
-            ]
-
-            st.write(
-                f"There are {len(boundaries)} boundaries "
-                "in the listed sample events."
-            )
-
-        elif "last" in q or "moment" in q or "happen" in q:
-            last_event = match_events[-1]
-
-            st.write(
-                f"The latest listed event is from over "
-                f"{last_event['over']}: {last_event['details']}"
-            )
-
-        else:
-            st.info(
-                "I can answer questions about the target, runs needed, "
-                "required run rate, balls remaining, wickets, and "
-                "key moments. Try asking about one of these!"
-            )
-
-    st.caption(
-        "Prototype question answering using predefined rules. "
-        "Not connected to an AI model or live match data."
-    )
+        st.caption(
+            "AI-generated answer based on the supplied sample match data. "
+            "Not connected to live scores."
+        )
 
 
 # ---------- FOOTER ----------
+
 st.markdown("""
 <div class="footer">
     CLUTCH © 2026 &nbsp; • &nbsp; BUILT FOR THE FANS
     <br><br>
-    Prototype using sample match data. Not connected to live scores.
+    AI-powered prototype using sample match data. Not connected to live scores.
 </div>
 """, unsafe_allow_html=True)
