@@ -1,9 +1,13 @@
-import math
+
+import html
+import re
 import requests
 import streamlit as st
 from groq import Groq
 
+
 # ---------- PAGE CONFIG ----------
+
 st.set_page_config(
     page_title="Clutch | Match Centre",
     page_icon="🏏",
@@ -11,36 +15,180 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+
 # ---------- API HELPERS ----------
+
+def parse_score(score_text, team_name):
+    """Keep each team's score, even if it cannot be parsed numerically."""
+
+    if not score_text:
+        return None
+
+    text = str(score_text).strip()
+
+    pattern = r"(\d+)\s*/\s*(\d+)(?:\s*\(([\d.]+)\))?"
+    result = re.search(pattern, text)
+
+    if result:
+        return {
+            "team": team_name,
+            "raw": text,
+            "r": int(result.group(1)),
+            "w": int(result.group(2)),
+            "o": result.group(3) or "?",
+        }
+
+    return {
+        "team": team_name,
+        "raw": text,
+        "r": None,
+        "w": None,
+        "o": None,
+    }
+
+
 @st.cache_data(ttl=60)
 def get_cricket_matches():
-    """Fetch current, upcoming, and recently completed matches from CricketData."""
+    """Fetch matches from CricketData."""
+
     api_key = st.secrets.get("CRICKET_API_KEY")
+
     if not api_key:
-        raise ValueError("CRICKET_API_KEY is missing from Streamlit secrets.")
+        raise ValueError("CRICKET_API_KEY is missing from secrets.")
 
     response = requests.get(
-        "https://api.cricapi.com/v1/currentMatches",
-        params={"apikey": api_key, "offset": 0},
+        "https://api.cricapi.com/v1/cricScore",
+        params={"apikey": api_key},
         timeout=20,
     )
+
     response.raise_for_status()
     result = response.json()
 
     if result.get("status") != "success":
-        raise ValueError(result.get("reason", "The cricket API returned an error."))
+        raise ValueError(result.get("reason", "Cricket API error"))
 
-    return result.get("data", [])
+    matches = []
+
+    for raw in result.get("data", []):
+
+        team1 = raw.get("t1") or "Team 1"
+        team2 = raw.get("t2") or "Team 2"
+
+        match_state = str(raw.get("ms", "")).lower()
+
+        scores = []
+
+        score1 = parse_score(raw.get("t1s"), team1)
+        score2 = parse_score(raw.get("t2s"), team2)
+
+        if score1:
+            scores.append(score1)
+
+        if score2:
+            scores.append(score2)
+
+        matches.append({
+            "id": raw.get("id"),
+            "name": f"{team1} vs {team2}",
+            "teams": [team1, team2],
+            "status": raw.get("status", "Status unavailable"),
+            "ms": match_state,
+            "matchStarted": match_state == "live",
+            "matchEnded": match_state == "result",
+            "matchType": raw.get("matchType", "Cricket"),
+            "venue": raw.get("venue", "Venue unavailable"),
+            "dateTimeGMT": raw.get("dateTimeGMT", ""),
+            "series": raw.get("series", ""),
+            "score": scores,
+        })
+
+    return matches
+
+
+def classify_match(match):
+    """Classify matches using the API's match-state field."""
+
+    state = str(match.get("ms", "")).lower()
+
+    if state == "live":
+        return "live"
+
+    if state == "fixture":
+        return "upcoming"
+
+    if state == "result":
+        return "completed"
+
+    status = str(match.get("status", "")).lower()
+
+    if match.get("matchEnded"):
+        return "completed"
+
+    if match.get("matchStarted"):
+        return "live"
+
+    if any(word in status for word in (
+        "won by", "draw", "no result", "abandoned",
+        "match tied", "completed"
+    )):
+        return "completed"
+
+    if any(word in status for word in (
+        "not started", "upcoming", "scheduled", "starts at"
+    )):
+        return "upcoming"
+
+    return "unknown"
+
+
+# ---------- AI HELPERS ----------
+
+def build_match_context(match):
+
+    teams = match.get("teams", [])
+    scores = match.get("score", [])
+
+    lines = [
+        f"Match: {match.get('name', 'Unknown')}",
+        f"Teams: {', '.join(teams)}",
+        f"Match type: {match.get('matchType', 'Unknown')}",
+        f"Status: {match.get('status', 'Unknown')}",
+        f"Series: {match.get('series', 'Not available')}",
+        f"Venue: {match.get('venue', 'Not available')}",
+        f"Date: {match.get('dateTimeGMT', 'Not available')}",
+    ]
+
+    if scores:
+        lines.append("Available team scores:")
+
+        for score in scores:
+            lines.append(
+                f"{score['team']}: {score['raw']}"
+            )
+    else:
+        lines.append("No score details are currently available.")
+
+    lines.append(
+        "Only match metadata and score summaries are available. "
+        "Do not invent ball-by-ball events, player statistics, "
+        "partnerships, toss details or match conditions. "
+        "If information is missing, clearly say it is unavailable."
+    )
+
+    return "\n".join(lines)
 
 
 def get_ai_response(system_prompt, user_prompt):
-    """Send a prompt to Groq and return the model response."""
+
     try:
         api_key = st.secrets.get("GROQ_API_KEY")
+
         if not api_key:
-            return "GROQ_API_KEY is missing. Add it to your Streamlit secrets."
+            return "GROQ_API_KEY is missing from Streamlit secrets."
 
         client = Groq(api_key=api_key)
+
         response = client.chat.completions.create(
             model="openai/gpt-oss-120b",
             messages=[
@@ -50,389 +198,445 @@ def get_ai_response(system_prompt, user_prompt):
             temperature=0.5,
             max_completion_tokens=700,
         )
-        return response.choices[0].message.content or "Clutch couldn't generate a response."
+
+        return (
+            response.choices[0].message.content
+            or "Clutch couldn't generate a response."
+        )
+
     except Exception as error:
-        return f"AI request failed: {error}"
-
-
-def overs_to_balls(overs_value):
-    """
-    Cricket overs are not decimal numbers:
-    5.1 means 5 overs and 1 ball, i.e. 31 balls.
-    """
-    try:
-        text = str(overs_value)
-        if "." in text:
-            whole, ball_part = text.split(".", 1)
-            whole_overs = int(whole or 0)
-            balls = int((ball_part + "0")[:1])
-        else:
-            whole_overs = int(float(text))
-            balls = 0
-        balls = max(0, min(balls, 5))
-        return whole_overs * 6 + balls
-    except (TypeError, ValueError):
-        return None
-
-
-def format_score(score):
-    runs = score.get("r", "?")
-    wickets = score.get("w", "?")
-    overs = score.get("o", "?")
-    innings = score.get("inning", "Innings")
-    return f"{innings}: {runs}/{wickets} ({overs} overs)"
-
-
-def build_match_context(match):
-    teams = match.get("teams") or []
-    scores = match.get("score") or []
-    lines = [
-        f"Match: {match.get('name', 'Unknown match')}",
-        f"Teams: {', '.join(teams) if teams else 'Not available'}",
-        f"Match type: {match.get('matchType', 'Not available')}",
-        f"Status: {match.get('status', 'Not available')}",
-        f"Venue: {match.get('venue', 'Not available')}",
-        f"Date: {match.get('date', 'Not available')}",
-    ]
-    if scores:
-        lines.append("Scores returned by the API:")
-        lines.extend(f"- {format_score(score)}" for score in scores)
-    else:
-        lines.append("The API has not supplied score details for this match.")
-
-    lines.append(
-        "Data limitation: the available response contains match metadata and score summaries only. "
-        "It does not provide verified ball-by-ball events in this app. Do not invent events, "
-        "player performances, partnerships, toss details, or match conditions."
-    )
-    return "\n".join(lines)
-
-
-def get_match_numbers(match):
-    """
-    Return basic chase metrics when the API provides at least two innings
-    and a recognizable limited-overs format. Otherwise return None.
-    """
-    scores = match.get("score") or []
-    match_type = str(match.get("matchType", "")).lower()
-
-    if match_type not in {"t20", "odi"} or len(scores) < 2:
-        return None
-
-    total_overs = 20 if match_type == "t20" else 50
-    first_innings = scores[0]
-    current_innings = scores[-1]
-
-    try:
-        target = int(first_innings["r"]) + 1
-        runs = int(current_innings["r"])
-        wickets = int(current_innings["w"])
-        balls_faced = overs_to_balls(current_innings["o"])
-        if balls_faced is None:
-            return None
-
-        total_balls = total_overs * 6
-        balls_left = max(total_balls - balls_faced, 0)
-        runs_needed = max(target - runs, 0)
-        overs_completed = balls_faced / 6
-        current_rate = runs / overs_completed if overs_completed > 0 else 0
-        required_rate = runs_needed / (balls_left / 6) if balls_left > 0 else None
-
-        return {
-            "target": target,
-            "runs": runs,
-            "wickets": wickets,
-            "balls_faced": balls_faced,
-            "balls_left": balls_left,
-            "runs_needed": runs_needed,
-            "total_overs": total_overs,
-            "current_rate": current_rate,
-            "required_rate": required_rate,
-            "current_innings": current_innings,
-        }
-    except (KeyError, TypeError, ValueError):
-        return None
+        return f"Request failed: {error}"
 
 
 # ---------- CUSTOM DESIGN ----------
+
 st.markdown(
     """
     <style>
         @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap');
 
+        :root {
+            --bg: #0B0D10;
+            --panel: #15191F;
+            --border: #2A3039;
+            --text: #F4F5F7;
+            --muted: #9299A6;
+            --accent: #D5FF65;
+        }
+
+        header[data-testid="stHeader"],
+        div[data-testid="stToolbar"],
+        div[data-testid="stDecoration"],
+        button[data-testid="stDeployButton"] {
+            display: none;
+        }
+
+        #MainMenu, footer {
+            visibility: hidden;
+        }
+
         .stApp {
-            background-color: #0B0D10;
-            color: #F4F5F7;
+            background: var(--bg);
+            color: var(--text);
             font-family: 'DM Sans', sans-serif;
         }
+
         .block-container {
-            max-width: 1050px;
-            padding-top: 2rem;
-            padding-bottom: 3rem;
+            max-width: 1100px;
+            padding-top: 1rem;
+            padding-bottom: 2rem;
         }
-        h1, h2, h3 {
+
+        h1, h2, h3, h4 {
             font-family: 'Space Grotesk', sans-serif !important;
-            color: #F4F5F7 !important;
+            color: var(--text) !important;
         }
-        p, label, span { font-family: 'DM Sans', sans-serif; }
+
         .brand {
             font-family: 'Space Grotesk', sans-serif;
-            font-size: 30px;
+            font-size: 29px;
             font-weight: 700;
             letter-spacing: -1.5px;
-            color: #D5FF65;
+            color: var(--accent);
         }
+
         .brand-subtitle {
-            color: #858B98;
-            font-size: 13px;
-            margin-top: -5px;
+            color: var(--muted);
+            font-size: 11px;
+            letter-spacing: 1.6px;
+            margin-top: 5px;
         }
+
         .section-label {
             color: #A1A7B2;
-            font-size: 12px;
-            font-weight: 600;
-            letter-spacing: 2px;
-            text-transform: uppercase;
-            margin-bottom: 14px;
-        }
-        .match-card {
-            background: linear-gradient(135deg, #191D24, #12151A);
-            border: 1px solid #2A3039;
-            border-radius: 18px;
-            padding: 26px;
-            margin: 12px 0 24px 0;
-        }
-        .match-status {
-            color: #D5FF65;
             font-size: 11px;
             font-weight: 700;
             letter-spacing: 1.5px;
+            text-transform: uppercase;
+            margin: 22px 0 10px 0;
         }
+
+        .match-card {
+            background: linear-gradient(135deg, #191D24, #12151A);
+            border: 1px solid var(--border);
+            border-radius: 15px;
+            padding: 21px;
+            margin: 8px 0 16px 0;
+        }
+
+        .match-status {
+            color: var(--accent);
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 1.4px;
+            text-transform: uppercase;
+            margin-bottom: 15px;
+        }
+
         .match-title {
             font-family: 'Space Grotesk', sans-serif;
-            font-size: 23px;
+            font-size: 21px;
             font-weight: 600;
-            margin: 12px 0 4px 0;
-            color: #F4F5F7;
+            margin-bottom: 5px;
+            color: var(--text);
         }
-        .match-subtitle { color: #858B98; font-size: 13px; }
-        .score-label { color: #858B98; font-size: 13px; }
-        .score-number {
-            font-family: 'Space Grotesk', sans-serif;
-            font-size: 36px;
-            font-weight: 700;
-            letter-spacing: -1px;
-            color: #FFFFFF;
-            margin-top: 5px;
+
+        .match-subtitle {
+            color: var(--muted);
+            font-size: 12px;
         }
-        .score-number span {
-            font-size: 17px;
-            color: #858B98;
+
+        .divider {
+            border-top: 1px solid var(--border);
+            margin: 17px 0;
+        }
+
+        .score-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            padding: 12px 0;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .score-row:last-child {
+            border-bottom: none;
+        }
+
+        .team-name {
+            color: #D7DBE2;
+            font-size: 13px;
             font-weight: 500;
         }
-        .divider { border-top: 1px solid #2A3039; margin: 22px 0; }
-        .metric-card {
-            background: #15191F;
-            border: 1px solid #282E37;
-            border-radius: 14px;
-            padding: 18px;
-            min-height: 105px;
-            margin-bottom: 10px;
-        }
-        .metric-label { color: #939AA7; font-size: 12px; margin-bottom: 10px; }
-        .metric-value {
+
+        .team-score {
             font-family: 'Space Grotesk', sans-serif;
-            font-size: 27px;
-            font-weight: 600;
-            color: #F4F5F7;
+            font-size: 23px;
+            font-weight: 700;
+            color: #FFFFFF;
+            text-align: right;
         }
-        .metric-highlight { color: #D5FF65; }
+
+        .score-unavailable {
+            color: var(--muted);
+            font-size: 13px;
+        }
+
         .feature-card {
-            background: #15191F;
+            background: var(--panel);
             border: 1px solid #282E37;
-            border-radius: 16px;
-            padding: 22px;
-            min-height: 130px;
-            margin-bottom: 12px;
+            border-radius: 13px;
+            padding: 17px;
+            margin: 8px 0 12px 0;
         }
+
         .feature-title {
             font-family: 'Space Grotesk', sans-serif;
-            font-size: 19px;
+            font-size: 17px;
             font-weight: 600;
-            margin-bottom: 8px;
-            color: #F4F5F7;
+            margin-bottom: 5px;
+            color: var(--text);
         }
-        .feature-description { color: #9BA2AE; font-size: 13px; line-height: 1.7; }
+
+        .feature-description {
+            color: #9BA2AE;
+            font-size: 12px;
+            line-height: 1.6;
+        }
+
         div.stButton > button {
-            background: #D5FF65;
+            background: var(--accent);
             color: #10130B;
             border: none;
-            border-radius: 9px;
+            border-radius: 8px;
             font-weight: 700;
-            min-height: 44px;
-            transition: 0.2s ease;
+            min-height: 38px;
+            padding: 0.35rem 1rem;
         }
+
         div.stButton > button:hover {
             background: #C3EE54;
             color: #10130B;
             border: none;
         }
-        div[data-testid="stAlert"] { border-radius: 10px; }
+
+        div[data-testid="stAlert"] {
+            border-radius: 9px;
+        }
+
+        div[role="radiogroup"] {
+            gap: 10px;
+            margin: 8px 0 16px 0;
+        }
+
+        div[role="radiogroup"] label {
+            background: #191D24;
+            border: 1px solid #2A3039;
+            border-radius: 9px;
+            padding: 7px 15px;
+        }
+
+        div[role="radiogroup"] label:hover {
+            border-color: var(--accent);
+        }
+
         .footer {
             color: #626A77;
-            font-size: 12px;
+            font-size: 11px;
             text-align: center;
-            padding-top: 24px;
+            padding-top: 20px;
             border-top: 1px solid #252A32;
-            margin-top: 30px;
+            margin-top: 26px;
         }
+
         @media (max-width: 640px) {
-            .block-container { padding: 1rem 1rem 2rem 1rem; }
-            .match-card { padding: 18px; }
-            .score-number { font-size: 28px; }
+            .block-container {
+                padding: 1rem 1rem 2rem 1rem;
+            }
+
+            .match-card {
+                padding: 16px;
+            }
+
+            .team-score {
+                font-size: 19px;
+            }
         }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
+
 # ---------- HEADER ----------
+
 header_left, header_right = st.columns([3, 1])
+
 with header_left:
+
     st.markdown(
         '<div class="brand">CLUTCH<span style="color:#F4F5F7">.</span></div>',
         unsafe_allow_html=True,
     )
+
     st.markdown(
         '<div class="brand-subtitle">THE INTELLIGENT MATCH COMPANION</div>',
         unsafe_allow_html=True,
     )
+
 with header_right:
+
     st.markdown(
-        '<div style="text-align:right;color:#858B98;font-size:12px;padding-top:12px;">'
-        'LIVE DATA &nbsp; • &nbsp; CRICKET</div>',
+        '<div style="text-align:right;color:#858B98;font-size:11px;padding-top:10px;">'
+        'CRICKET&nbsp;&nbsp;·&nbsp;&nbsp;MATCH CENTRE</div>',
         unsafe_allow_html=True,
     )
-st.markdown("<br>", unsafe_allow_html=True)
 
-# ---------- SELECT MATCH ----------
-st.markdown('<div class="section-label">SELECT A MATCH</div>', unsafe_allow_html=True)
+
+# ---------- FETCH MATCHES ----------
 
 try:
     matches = get_cricket_matches()
+
 except Exception as error:
-    st.error(f"Could not fetch cricket matches: {error}")
+
+    st.error(f"Could not fetch matches: {error}")
+
     st.info(
-        "Check that CRICKET_API_KEY is set in .streamlit/secrets.toml "
-        "and in your Streamlit Community Cloud app secrets."
+        "Check CRICKET_API_KEY in your local secrets.toml "
+        "and Streamlit Community Cloud secrets."
     )
+
     st.stop()
+
 
 if not matches:
-    st.info("The API did not return any matches right now.")
+    st.info("No matches were returned by the cricket API.")
     st.stop()
 
+
+# ---------- CATEGORISE MATCHES ----------
+
+live_matches = []
+upcoming_matches = []
+completed_matches = []
+unclassified_matches = []
+
+for match in matches:
+
+    category = classify_match(match)
+
+    if category == "live":
+        live_matches.append(match)
+
+    elif category == "upcoming":
+        upcoming_matches.append(match)
+
+    elif category == "completed":
+        completed_matches.append(match)
+
+    else:
+        unclassified_matches.append(match)
+
+
+# ---------- MATCH NAVIGATION ----------
+
+active_tab = st.radio(
+    "Match category",
+    ["Live", "Upcoming", "Completed"],
+    horizontal=True,
+    label_visibility="collapsed",
+    key="active_match_tab",
+)
+
+category_map = {
+    "Live": (live_matches, "LIVE"),
+    "Upcoming": (upcoming_matches, "UPCOMING"),
+    "Completed": (completed_matches, "COMPLETED"),
+}
+
+active_matches, selected_category = category_map[active_tab]
+
+st.markdown(
+    f'<div class="section-label">{active_tab.upper()} MATCHES · {len(active_matches)}</div>',
+    unsafe_allow_html=True,
+)
+
+if not active_matches:
+
+    if unclassified_matches:
+        st.caption(
+            f"{len(unclassified_matches)} match(es) have an unclear API status."
+        )
+
+    st.info(
+        f"No {active_tab.lower()} matches are currently available from the API."
+    )
+
+    st.stop()
+
+
 selected_match = st.selectbox(
-    "Choose a match",
-    matches,
+    "Select match",
+    active_matches,
     format_func=lambda match: (
         f"{match.get('name', 'Unknown match')} — "
         f"{match.get('status', 'Status unavailable')}"
     ),
+    key=f"{active_tab.lower()}_match_picker",
 )
 
-teams = selected_match.get("teams") or []
-scores = selected_match.get("score") or []
+
+# ---------- SELECTED MATCH DATA ----------
+
+teams = selected_match.get("teams", [])
+scores = selected_match.get("score", [])
+
 match_name = selected_match.get("name", "Cricket match")
 match_status = selected_match.get("status", "Status unavailable")
 venue = selected_match.get("venue", "Venue unavailable")
-match_type = str(selected_match.get("matchType", "cricket")).upper()
+match_type = str(selected_match.get("matchType", "Cricket")).upper()
+series = selected_match.get("series", "")
+match_date = selected_match.get("dateTimeGMT", "")
+
 match_context = build_match_context(selected_match)
-numbers = get_match_numbers(selected_match)
 
-st.caption(f"**Teams:** {' vs '.join(teams) if teams else 'Not available'}")
-st.caption(f"**Venue:** {venue}  ·  **Status:** {match_status}")
 
-# ---------- MATCH CENTRE / 01 ----------
-st.markdown('<div class="section-label">MATCH CENTRE / 01</div>', unsafe_allow_html=True)
+if series:
+    st.caption(f"Series: {series}")
 
-if scores:
-    current_score = scores[-1]
-    score_runs = current_score.get("r", "?")
-    score_wickets = current_score.get("w", "?")
-    score_overs = current_score.get("o", "?")
-    innings_name = current_score.get("inning", "Latest innings")
-    score_html = f'{score_runs}<span>/{score_wickets}</span>'
-else:
-    innings_name = "Score unavailable"
-    score_overs = "—"
-    score_html = "—"
+
+# ---------- MATCH CENTRE ----------
 
 st.markdown(
-    f"""
-    <div class="match-card">
-        <div class="match-status">● &nbsp; {match_status.upper()}</div>
-        <div class="match-title">{match_name}</div>
-        <div class="match-subtitle">{match_type} &nbsp; / &nbsp; {venue}</div>
-        <div class="divider"></div>
-        <div class="score-label">{innings_name}</div>
-        <div class="score-number">{score_html}</div>
-        <div class="match-subtitle">{score_overs} overs</div>
-    </div>
-    """,
+    '<div class="section-label">MATCH CENTRE</div>',
     unsafe_allow_html=True,
 )
 
-if scores:
-    with st.expander("View all score entries from the API"):
-        for score in scores:
-            st.write(
-                f"**{score.get('inning', 'Innings')}** — "
-                f"{score.get('r', '?')}/{score.get('w', '?')} "
-                f"({score.get('o', '?')} overs)"
-            )
-else:
-    st.info("The API has not supplied score details for this match.")
+score_rows_html = ""
 
-# ---------- THE NUMBERS / 02 ----------
-st.markdown('<div class="section-label">THE NUMBERS / 02</div>', unsafe_allow_html=True)
+for score in scores:
 
-if numbers:
-    metric_values = [
-        ("TARGET", str(numbers["target"]), False),
-        ("RUNS NEEDED", str(numbers["runs_needed"]), True),
-        ("BALLS LEFT", str(numbers["balls_left"]), False),
-    ]
-    metric_columns = st.columns(3)
-    for column, (label, value, highlight) in zip(metric_columns, metric_values):
-        with column:
-            value_class = "metric-value metric-highlight" if highlight else "metric-value"
-            st.markdown(
-                f"""
-                <div class="metric-card">
-                    <div class="metric-label">{label}</div>
-                    <div class="{value_class}">{value}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-else:
-    st.info(
-        "Chase metrics are unavailable for this selection. They are calculated only "
-        "when the API supplies at least two innings for a T20 or ODI match."
-    )
+    team = html.escape(str(score.get("team", "Team")))
+    raw_score = html.escape(str(score.get("raw", "Score unavailable")))
 
-st.markdown("<br>", unsafe_allow_html=True)
+    score_rows_html += f"""
+    <div class="score-row">
+        <div class="team-name">{team}</div>
+        <div class="team-score">{raw_score}</div>
+    </div>
+    """
 
-# ---------- CATCH ME UP / 03 ----------
-st.markdown('<div class="section-label">CATCH ME UP / 03</div>', unsafe_allow_html=True)
+
+if not score_rows_html:
+    score_rows_html = """
+    <div class="score-unavailable">
+        Score details are not available for this match yet.
+    </div>
+    """
+
+match_card_html = f"""
+<div class="match-card">
+    <div class="match-status">
+        ● &nbsp; {html.escape(selected_category)} &nbsp; · &nbsp;
+        {html.escape(str(match_status).upper())}
+    </div>
+
+    <div class="match-title">{html.escape(str(match_name))}</div>
+
+    <div class="match-subtitle">
+        {html.escape(match_type)} &nbsp; / &nbsp;
+        {html.escape(str(venue))}
+    </div>
+
+    <div class="divider"></div>
+
+    {score_rows_html}
+</div>
+"""
+
+st.html(match_card_html)
+
+
+if match_date:
+    st.caption(f"Scheduled / recorded time (GMT): {match_date}")
+
+
+# ---------- MATCH SUMMARY ----------
+
+st.markdown(
+    '<div class="section-label">MATCH SUMMARY</div>',
+    unsafe_allow_html=True,
+)
+
 st.markdown(
     """
     <div class="feature-card">
-        <div class="feature-title">Missed the action?</div>
+        <div class="feature-title">Get the match at a glance</div>
         <div class="feature-description">
-            Get an AI explanation of the selected match using the match details and
-            scores available from the API. Ball-by-ball events may not be available.
+            Understand the score and match situation without going through
+            every detail.
         </div>
     </div>
     """,
@@ -440,163 +644,58 @@ st.markdown(
 )
 
 fan_level = st.selectbox(
-    "Choose how you want the match explained",
+    "Explanation level",
     ["Beginner", "Regular fan", "Analyst"],
     key="fan_level",
 )
 
-if st.button("⚡ Generate AI Match Story", use_container_width=True):
+
+if st.button("Generate Match Summary", key="summary_button"):
+
     system_prompt = f"""
-You are Clutch, an AI cricket match companion.
+You are Clutch, a cricket match companion.
+
 The user's cricket knowledge level is {fan_level}.
-- Beginner: use simple words and explain cricket terms.
-- Regular fan: explain the score and what it means.
-- Analyst: give tactical context only when supported by the data.
-Use only the supplied match information. Do not invent events, player statistics,
-partnerships, toss details, or match conditions. The available data may contain
-only a score summary, not ball-by-ball commentary. State those limitations clearly.
-Keep the answer concise and useful.
+
+Beginner: explain cricket terms in simple language.
+Regular fan: explain the score and match situation.
+Analyst: provide tactical context only when supported by the data.
+
+Use only the supplied match information.
+Do not invent events, player statistics, partnerships, toss details,
+or match conditions.
+
+If the available data is insufficient, say so clearly.
+
+Keep the answer concise, useful and easy to understand.
 """
-    with st.spinner("Clutch is analysing the selected match..."):
+
+    with st.spinner("Preparing match summary..."):
+
         story = get_ai_response(
             system_prompt,
-            f"Explain the current match situation using this data:\n{match_context}",
+            f"Explain this match using the available information:\n{match_context}",
         )
-    st.markdown("### 🏏 AI Match Story")
+
+    st.markdown("#### Match Summary")
     st.markdown(story)
-    st.caption("AI-generated explanation based on the match information returned by the cricket API.")
 
-# ---------- MATCH INSIGHTS / 04 ----------
-st.markdown("<br>", unsafe_allow_html=True)
-st.markdown('<div class="section-label">MATCH INSIGHTS / 04</div>', unsafe_allow_html=True)
+    st.caption("Based on match information returned by the cricket API.")
+
+
+# ---------- ASK CLUTCH ----------
+
 st.markdown(
-    """
-    <div class="feature-card">
-        <div class="feature-title">Understand the pressure.</div>
-        <div class="feature-description">
-            Explore the required run rate and current scoring rate when the selected
-            match has enough limited-overs innings data.
-        </div>
-    </div>
-    """,
+    '<div class="section-label">ASK CLUTCH</div>',
     unsafe_allow_html=True,
 )
 
-if st.button("Analyse match situation →", use_container_width=True):
-    if not numbers:
-        st.warning(
-            "This match does not have enough innings data to calculate a chase. "
-            "Choose a T20 or ODI match with at least two score entries."
-        )
-    else:
-        a, b = st.columns(2)
-        with a:
-            st.metric(
-                "Required run rate",
-                f'{numbers["required_rate"]:.2f}' if numbers["required_rate"] is not None else "—",
-            )
-        with b:
-            st.metric("Current run rate", f'{numbers["current_rate"]:.2f}')
-
-        if numbers["balls_left"] > 0:
-            st.info(
-                f'The chasing side needs {numbers["runs_needed"]} runs from '
-                f'{numbers["balls_left"]} balls. The required rate is '
-                f'{numbers["required_rate"]:.2f} runs per over, compared with a '
-                f'current scoring rate of {numbers["current_rate"]:.2f}.'
-            )
-        elif numbers["runs_needed"] == 0:
-            st.success("The target shown by the score data has been reached.")
-        else:
-            st.info("No balls remain in the configured limited-overs innings.")
-        st.caption("This is a mathematical calculation, not a trained win-probability model.")
-
-# ---------- WIN PREDICTOR / 05 ----------
-st.markdown("<br>", unsafe_allow_html=True)
-st.markdown('<div class="section-label">WIN PREDICTOR / 05</div>', unsafe_allow_html=True)
 st.markdown(
     """
     <div class="feature-card">
-        <div class="feature-title">Explore a hypothetical chase.</div>
+        <div class="feature-title">Have a question about the match?</div>
         <div class="feature-description">
-            Change the inputs to see how required runs, overs and wickets affect
-            a simple illustrative score. This is not a real win probability.
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-st.markdown("#### Adjust a hypothetical T20 chase")
-
-input_col1, input_col2 = st.columns(2)
-with input_col1:
-    current_runs = st.slider("Runs scored", min_value=0, max_value=250, value=120, step=1)
-    wickets = st.slider("Wickets lost", min_value=0, max_value=10, value=4, step=1)
-with input_col2:
-    overs = st.slider("Completed overs", min_value=0, max_value=19, value=15, step=1)
-    prediction_target = st.number_input("Target runs", min_value=1, max_value=300, value=180, step=1)
-
-runs_remaining = max(int(prediction_target) - current_runs, 0)
-balls_remaining_predictor = (20 - overs) * 6
-st.markdown("---")
-
-if current_runs >= prediction_target:
-    st.success("🏆 The target has been reached in this hypothetical scenario!")
-elif wickets == 10 or balls_remaining_predictor == 0:
-    st.error("The hypothetical chase is over. The target was not reached.")
-else:
-    overs_remaining = balls_remaining_predictor / 6
-    required_run_rate = runs_remaining / overs_remaining
-    current_run_rate = current_runs / overs if overs > 0 else 0
-    wickets_remaining = 10 - wickets
-
-    # Manually designed heuristic only; not trained on historical matches.
-    difficulty = (
-        (required_run_rate * 3)
-        - (wickets_remaining * 1.5)
-        - (current_run_rate * 0.5)
-    )
-    estimated_chance = 100 / (1 + math.exp(max(-20, min(20, difficulty - 12))))
-    estimated_chance = max(5, min(95, estimated_chance))
-
-    metric1, metric2, metric3 = st.columns(3)
-    metric1.metric("Runs remaining", runs_remaining)
-    metric2.metric("Balls remaining", balls_remaining_predictor)
-    metric3.metric("Required run rate", f"{required_run_rate:.2f}")
-
-    st.markdown("#### Illustrative chase outlook")
-    st.progress(int(estimated_chance))
-    st.markdown(
-        f"""
-        <div style="text-align:center;padding:10px;">
-            <div style="font-size:42px;font-weight:700;color:#D5FF65;">
-                {estimated_chance:.1f}%
-            </div>
-            <div style="color:#9BA2AE;font-size:13px;">
-                Prototype heuristic score — not a real win probability
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    if required_run_rate > 12:
-        st.warning("The chase is under heavy scoring pressure: more than 12 runs per over are needed.")
-    elif required_run_rate > 9:
-        st.info("The scoring rate needs to increase; remaining wickets could be important.")
-    else:
-        st.success("The required scoring rate is relatively manageable, but match conditions still matter.")
-    st.caption("Hypothetical T20 scenario. This is a manually designed heuristic, not a trained ML model.")
-
-# ---------- ASK CLUTCH / 06 ----------
-st.markdown("<br>", unsafe_allow_html=True)
-st.markdown('<div class="section-label">ASK CLUTCH / 06</div>', unsafe_allow_html=True)
-st.markdown(
-    """
-    <div class="feature-card">
-        <div class="feature-title">Your match. Your questions.</div>
-        <div class="feature-description">
-            Ask about the selected match and get an explanation tailored to your
-            cricket knowledge level.
+            Ask Clutch to explain the score, match status or available cricket details.
         </div>
     </div>
     """,
@@ -604,40 +703,59 @@ st.markdown(
 )
 
 question = st.text_input(
-    "Ask a question",
+    "Your question",
     placeholder="e.g. What does this score mean?",
     key="clutch_question",
 )
 
-if st.button("Ask Clutch →", use_container_width=True):
+
+if st.button("Ask Clutch", key="ask_button"):
+
     if not question.strip():
-        st.warning("Please enter a question first.")
+
+        st.warning("Enter a question first.")
+
     else:
+
         system_prompt = f"""
-You are Clutch, an AI cricket match companion.
+You are Clutch, a cricket match companion.
+
 The user's cricket knowledge level is {fan_level}.
-Answer clearly and concisely. Explain cricket terms when useful.
-Use only the match information provided. Do not invent scores, events, player
-statistics, or match conditions. If the data does not contain the answer,
-say that it is unavailable.
+
+Answer clearly and concisely.
+Explain cricket terms when useful.
+
+Use only the match information provided.
+Do not invent scores, events, player statistics or match conditions.
+
+If the data does not contain the answer, say that it is unavailable.
 """
+
         with st.spinner("Clutch is thinking..."):
+
             answer = get_ai_response(
                 system_prompt,
-                f"Match information:\n{match_context}\n\nUser question:\n{question}",
+                f"Match information:\n{match_context}\n\n"
+                f"User question:\n{question}",
             )
-        st.markdown("#### 💬 Clutch's Answer")
+
+        st.markdown("#### Clutch's Answer")
         st.markdown(answer)
-        st.caption("AI-generated answer based on the selected match's available API data.")
+
+        st.caption(
+            "Answer based on the selected match's available API data."
+        )
+
 
 # ---------- FOOTER ----------
+
 st.markdown(
     """
     <div class="footer">
-        CLUTCH © 2026 &nbsp; • &nbsp; BUILT FOR THE FANS
+        CLUTCH © 2026 &nbsp; · &nbsp; BUILT FOR THE FANS
         <br><br>
-        AI-powered cricket companion. Match coverage and score details depend on API availability.
-        Win predictor is an illustrative heuristic, not a real probability.
+        Match coverage depends on cricket API availability.
+        AI responses are based on available match data.
     </div>
     """,
     unsafe_allow_html=True,
